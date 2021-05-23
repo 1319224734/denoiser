@@ -14,8 +14,6 @@ from torch.nn import functional as F
 
 from .resample import downsample2, upsample2
 from .utils import capture_init
-from typing import Optional, List
-
 
 
 class BLSTM(nn.Module):
@@ -32,14 +30,6 @@ class BLSTM(nn.Module):
         if self.linear:
             x = self.linear(x)
         return x, hidden
-
-class Empty(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, input):
-        return input
-
 
 
 def rescale_conv(conv, reference):
@@ -126,34 +116,22 @@ class Demucs(nn.Module):
             self.encoder.append(nn.Sequential(*encode))
 
             decode = []
-            m_Conv1d = th.jit.trace(nn.Conv1d(hidden, ch_scale * hidden, 1), th.rand(1, hidden, 100))
-            m_ConvTranspose1d = th.jit.trace(nn.ConvTranspose1d(hidden, chout, kernel_size, stride), th.rand(1, hidden, 100))
             decode += [
-                # nn.Conv1d(hidden, ch_scale * hidden, 1), activation,
-                # nn.ConvTranspose1d(hidden, chout, kernel_size, stride),
-                m_Conv1d, activation,
-                m_ConvTranspose1d,
+                nn.Conv1d(hidden, ch_scale * hidden, 1), activation,
+                nn.ConvTranspose1d(hidden, chout, kernel_size, stride),
             ]
             if index > 0:
                 decode.append(nn.ReLU())
-            else:
-                decode.append(Empty())  # 为了streamer里decoder[3]
-            d_model = nn.Sequential(*decode)
-            self.decoder.insert(0, d_model)
+            self.decoder.insert(0, nn.Sequential(*decode))
             chout = hidden
             chin = hidden
             hidden = min(int(growth * hidden), max_hidden)
 
         self.lstm = BLSTM(chin, bi=not causal)
-        self.lstm = th.jit.trace(self.lstm, (th.rand(1, 1, 768), (th.rand(2, 1, 768), th.rand(2, 1, 768))))
-
-        self.upsample2 = th.jit.trace(upsample2, th.rand(1, 1, 64085))
-        self.downsample2 = th.jit.trace(downsample2, th.rand(1, 1, 64085))
-        self.total_stride = self.stride ** self.depth // self.resample
         if rescale:
             rescale_module(self, reference=rescale)
 
-    def valid_length(self, length: int):
+    def valid_length(self, length):
         """
         Return the nearest valid length to use with the model so that
         there is no time steps left over in a convolutions, e.g. for all
@@ -171,9 +149,9 @@ class Demucs(nn.Module):
         length = int(math.ceil(length / self.resample))
         return int(length)
 
-    # @property
-    # def total_stride(self):
-    #     return self.stride ** self.depth // self.resample
+    @property
+    def total_stride(self):
+        return self.stride ** self.depth // self.resample
 
     def forward(self, mix):
         if mix.dim() == 2:
@@ -184,32 +162,31 @@ class Demucs(nn.Module):
             std = mono.std(dim=-1, keepdim=True)
             mix = mix / (self.floor + std)
         else:
-            std = th.tensor(1)
+            std = 1
         length = mix.shape[-1]
         x = mix
         x = F.pad(x, (0, self.valid_length(length) - length))
         if self.resample == 2:
-            x = self.upsample2(x)
+            x = upsample2(x)
         elif self.resample == 4:
-            x = self.upsample2(x)
-            x = self.upsample2(x)
+            x = upsample2(x)
+            x = upsample2(x)
         skips = []
         for encode in self.encoder:
             x = encode(x)
             skips.append(x)
         x = x.permute(2, 0, 1)
-        _ = (th.zeros(2, 1, 768), th.zeros(2, 1, 768))
-        x, _ = self.lstm(x, _)
+        x, _ = self.lstm(x)
         x = x.permute(1, 2, 0)
         for decode in self.decoder:
             skip = skips.pop(-1)
             x = x + skip[..., :x.shape[-1]]
             x = decode(x)
         if self.resample == 2:
-            x = self.downsample2(x)
+            x = downsample2(x)
         elif self.resample == 4:
-            x = self.downsample2(x)
-            x = self.downsample2(x)
+            x = downsample2(x)
+            x = downsample2(x)
 
         x = x[..., :length]
         return std * x
@@ -236,7 +213,7 @@ def fast_conv(conv, x):
     return out.view(batch, chout, -1)
 
 
-class DemucsStreamer(nn.Module):
+class DemucsStreamer:
     """
     Streaming implementation for Demucs. It supports being fed with any amount
     of audio at a time. You will get back as much audio as possible at that
@@ -258,12 +235,10 @@ class DemucsStreamer(nn.Module):
                  num_frames=1,
                  resample_lookahead=64,
                  resample_buffer=256):
-        super().__init__()
         device = next(iter(demucs.parameters())).device
         self.demucs = demucs
-        self.lstm_state = (th.zeros(2, 1, 768), th.zeros(2, 1, 768))
-        self.conv_state = [th.tensor(float('inf'))]
-        # self.conv_state: List[th.Tensor]
+        self.lstm_state = None
+        self.conv_state = None
         self.dry = dry
         self.resample_lookahead = resample_lookahead
         resample_buffer = min(demucs.total_stride, resample_buffer)
@@ -274,9 +249,9 @@ class DemucsStreamer(nn.Module):
         self.resample_in = th.zeros(demucs.chin, resample_buffer, device=device)
         self.resample_out = th.zeros(demucs.chin, resample_buffer, device=device)
 
-        self.frames = th.tensor(0.)
-        self.total_time = th.tensor(0.)
-        self.variance = th.tensor(0.)
+        self.frames = 0
+        self.total_time = 0
+        self.variance = 0
         self.pending = th.zeros(demucs.chin, 0, device=device)
 
         bias = demucs.decoder[0][2].bias
@@ -285,30 +260,14 @@ class DemucsStreamer(nn.Module):
         self._bias = bias.view(-1, 1).repeat(1, kernel).view(-1, 1)
         self._weight = weight.permute(1, 2, 0).contiguous()
 
-        self.upsample2 = th.jit.trace(upsample2, th.rand(1, 64085))
-        self.downsample2 = th.jit.trace(downsample2, th.rand(1, 64085))
-
-    @th.jit.export
-    def reset(self):
-        self.lstm_state = (th.zeros(2, 1, 768), th.zeros(2, 1, 768))
-        self.conv_state = [th.tensor(float('inf'))]
-        self.resample_in = th.zeros(self.demucs.chin, self.resample_buffer)
-        self.resample_out = th.zeros(self.demucs.chin, self.resample_buffer)
-        self.frames = th.tensor(0.)
-        self.variance = th.tensor(0.)
-        self.pending = th.zeros(self.demucs.chin, 0)
-
     def reset_time_per_frame(self):
         self.total_time = 0
         self.frames = 0
 
     @property
     def time_per_frame(self):
-        if self.frames == 0:
-            return -1
         return self.total_time / self.frames
 
-    @th.jit.export
     def flush(self):
         """
         Flush remaining audio by padding it with zero. Call this
@@ -319,13 +278,12 @@ class DemucsStreamer(nn.Module):
         out = self.feed(padding)
         return out[:, :pending_length]
 
-    @th.jit.export
-    def feed(self, wav) -> th.Tensor:
+    def feed(self, wav):
         """
         Apply the model to mix using true real time evaluation.
         Normalization is done online as is the resampling.
         """
-        # begin = time.time()
+        begin = time.time()
         demucs = self.demucs
         resample_buffer = self.resample_buffer
         stride = self.stride
@@ -353,21 +311,19 @@ class DemucsStreamer(nn.Module):
             frame = padded_frame
 
             if resample == 4:
-                frame = self.upsample2(self.upsample2(frame))
+                frame = upsample2(upsample2(frame))
             elif resample == 2:
-                frame = self.upsample2(frame)
+                frame = upsample2(frame)
             frame = frame[:, resample * resample_buffer:]  # remove pre sampling buffer
             frame = frame[:, :resample * self.frame_length]  # remove extra samples after window
 
             out, extra = self._separate_frame(frame)
-            # out = th.rand([1, 1024])
-            # extra = th.rand([1, 1364])
             padded_out = th.cat([self.resample_out, out, extra], 1)
             self.resample_out[:] = out[:, -resample_buffer:]
             if resample == 4:
-                out = self.downsample2(self.downsample2(padded_out))
+                out = downsample2(downsample2(padded_out))
             elif resample == 2:
-                out = self.downsample2(padded_out)
+                out = downsample2(padded_out)
             else:
                 out = padded_out
 
@@ -380,39 +336,28 @@ class DemucsStreamer(nn.Module):
             outs.append(out)
             self.pending = self.pending[:, stride:]
 
-        # self.total_time += time.time() - begin
-        if len(outs) != 0:
+        self.total_time += time.time() - begin
+        if outs:
             out = th.cat(outs, 1)
         else:
             out = th.zeros(chin, 0, device=wav.device)
-        # out = th.tensor(1)
         return out
-
-
 
     def _separate_frame(self, frame):
         demucs = self.demucs
         skips = []
         next_state = []
-        # first = self.conv_state is None
-        if len(self.conv_state[0].shape) == 0 and self.conv_state[0] == th.tensor(float('inf')):
-            first = True
-        else:
-            first = False
-        # first = self.conv_state
+        first = self.conv_state is None
         stride = self.stride * demucs.resample
         x = frame[None]
         for idx, encode in enumerate(demucs.encoder):
-            stride /= demucs.stride
-            stride = int(stride)
+            stride //= demucs.stride
             length = x.shape[2]
             if idx == demucs.depth - 1:
                 # This is sligthly faster for the last conv
-                # x = fast_conv(encode[0], x)
-                x = encode[0](x)
+                x = fast_conv(encode[0], x)
                 x = encode[1](x)
-                # x = fast_conv(encode[2], x)
-                x = encode[2](x)
+                x = fast_conv(encode[2], x)
                 x = encode[3](x)
             else:
                 if not first:
@@ -422,11 +367,8 @@ class DemucsStreamer(nn.Module):
                     missing = tgt - prev.shape[-1]
                     offset = length - demucs.kernel_size - demucs.stride * (missing - 1)
                     x = x[..., offset:]
-                else:
-                    prev = th.tensor(-1)
                 x = encode[1](encode[0](x))
-                # x = fast_conv(encode[2], x)
-                x = encode[2](x)
+                x = fast_conv(encode[2], x)
                 x = encode[3](x)
                 if not first:
                     x = th.cat([prev, x], -1)
@@ -434,8 +376,7 @@ class DemucsStreamer(nn.Module):
             skips.append(x)
 
         x = x.permute(2, 0, 1)
-        x, _ = demucs.lstm(x, self.lstm_state)
-        self.lstm_state = _
+        x, self.lstm_state = demucs.lstm(x, self.lstm_state)
         x = x.permute(1, 2, 0)
         # In the following, x contains only correct samples, i.e. the one
         # for which each time position is covered by two window of the upper layer.
@@ -445,8 +386,7 @@ class DemucsStreamer(nn.Module):
         for idx, decode in enumerate(demucs.decoder):
             skip = skips.pop(-1)
             x += skip[..., :x.shape[-1]]
-            # x = fast_conv(decode[0], x)
-            x = decode[0](x)
+            x = fast_conv(decode[0], x)
             x = decode[1](x)
 
             if extra is not None:
@@ -454,11 +394,7 @@ class DemucsStreamer(nn.Module):
                 extra += skip[..., :extra.shape[-1]]
                 extra = decode[2](decode[1](decode[0](extra)))
             x = decode[2](x)
-
-            # next_state.append(x[..., -demucs.stride:] - decode[2].bias.view(-1, 1))
             next_state.append(x[..., -demucs.stride:] - decode[2].bias.view(-1, 1))
-            # else:
-            #     next_state.append(x[..., -demucs.stride:])
             if extra is None:
                 extra = x[..., -demucs.stride:]
             else:
@@ -493,14 +429,9 @@ def test():
         th.set_num_threads(args.num_threads)
     sr = args.sample_rate
     sr_ms = sr / 1000
-    url = 'https://dl.fbaipublicfiles.com/adiyoss/denoiser/dns48-11decc9d8e3f0998.th'
-    state_dict = th.hub.load_state_dict_from_url(url, map_location='cpu')
     demucs = Demucs(depth=args.depth, hidden=args.hidden, resample=args.resample).to(args.device)
-    demucs.load_state_dict(state_dict)
-    demucs = th.jit.script(demucs)
     x = th.randn(1, int(sr * 4)).to(args.device)
     out = demucs(x[None])[0]
-
     streamer = DemucsStreamer(demucs, num_frames=args.num_frames)
     out_rt = []
     frame_size = streamer.total_length

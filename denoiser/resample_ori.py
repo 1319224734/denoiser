@@ -10,7 +10,7 @@ import math
 import torch as th
 from torch.nn import functional as F
 
-@th.jit.script
+
 def sinc(t):
     """sinc.
 
@@ -56,12 +56,6 @@ def kernel_downsample2(zeros=56):
     kernel = (sinc(t) * winodd).view(1, 1, -1)
     return kernel
 
-@th.jit.script
-def x_pad(x):
-    if x.shape[-1] % 2 != 0:
-        x = F.pad(x, (0, 1))
-        return x
-    return x
 
 def downsample2(x, zeros=56):
     """
@@ -70,9 +64,8 @@ def downsample2(x, zeros=56):
     ICASSP'84. IEEE International Conference on Acoustics, Speech, and Signal Processing.
     Vol. 9. IEEE, 1984.
     """
-    # if x.shape[-1] % 2 != 0:
-    #     x = F.pad(x, (0, 1))
-    x = x_pad(x)
+    if x.shape[-1] % 2 != 0:
+        x = F.pad(x, (0, 1))
     xeven = x[..., ::2]
     xodd = x[..., 1::2]
     *other, time = xodd.shape
@@ -80,4 +73,3 @@ def downsample2(x, zeros=56):
     out = xeven + F.conv1d(xodd.view(-1, 1, time), kernel, padding=zeros)[..., :-1].view(
         *other, time)
     return out.view(*other, -1).mul(0.5)
-
